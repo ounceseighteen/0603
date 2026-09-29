@@ -1,0 +1,876 @@
+Аудит проекта «Мир Кино» по OWASP Top 10:2025
+Ниже — построчный разбор по всем десяти категориям, а также отдельно по legacy-коду и разбиению модулей. По каждой категории — вердикт (нашел / проверил / чисто / не применимо) и находки в требуемом формате.
+
+A01 — Контроль доступа (Broken Access Control)
+Вердикт: нашел
+
+Находка A01-1. @login_required не различает роли на пользовательских маршрутах
+Файл и строка: public.py, @public_bp.route('/book', methods=['POST']) → def book(): (строка с @login_required над book), а также cabinet.py api_ticket (строка с декоратором @login_required), cabinet.py cancel_booking (строка @cabinet_bp.route('/cancel_booking/<int:booking_id>', methods=['POST']) + @login_required).
+
+Что даёт злоумышленник на вход: логинится как cashier (роль есть в системе, см. security.ALLOWED_ROLES и seed_db, где создаётся cashier@demo.ru). Затем вызывает POST /cancel_booking/<id> для чужой брони или POST /book (или POST /client/book из staff.py).
+
+Что получает на выходе: cancel_booking проверяет роль только внутри if-ветки:
+
+python
+if user['role'] in ('admin', 'cashier'):
+    booking = conn.execute('SELECT * FROM bookings WHERE id=?', ...)
+else:
+    booking = ... WHERE id=? AND user_id=? ...
+То есть кассир может отменить любую бронь. А book() в public.py вообще не проверяет роль — кассир/админ может создавать себе брони как клиент, обходя бизнес-правила (например, лимиты). api_ticket для не-клиента тоже отдаёт любой билет по id без проверки владельца (ветка else в cabinet.py):
+
+python
+if user['role'] == 'client':
+    row = ... WHERE b.id=? AND b.user_id=?
+else:
+    row = ... WHERE b.id=?
+Насколько опасно: средне-высоко. Роль cashier задумана как «продажа на кассе», а не «чтение любых билетов и отмена чужих броней без ограничения сценария». Плюс любой сотрудник может действовать как клиент. Для полноценного IDOR клиента нет (там есть AND b.user_id=?), но модель ролей нарушена.
+
+Находка A01-2. admin_user_role/admin_user_ban — админ может разжаловать/забанить другого админа, кроме себя
+Файл и строка: admin.py, @admin_bp.route('/admin/users/ban/<int:user_id>', methods=['POST']) → def admin_user_ban(...): проверка if user['id'] == user_id: return redirect(...); аналогично admin_user_role.
+
+Что даёт злоумышленник на вход: скомпрометированный аккаунт admin отправляет POST на /admin/users/role/<other_admin_id> с role=cashier.
+
+Что получает на выходе: роль второго администратора понижается. Единственная защита — «нельзя себе». При наличии двух админов один может «съесть» другого.
+
+Насколько опасно: средне. Это не эскалация прав, но ослабление контроля: скомпрометированный админ может нейтрализовать второго админа.
+
+Находка A01-3. admin_hall_delete/admin_film_delete/admin_session_delete — разрушительные операции без подтверждения паролем/2FA
+Файл и строка: admin.py, функции admin_film_delete (строка с @admin_bp.route('/admin/films/delete/<int:film_id>', methods=['POST'])), admin_hall_delete, admin_session_delete.
+
+Что даёт злоумышленник на вход: скомпрометированная админ-сессия (или CSRF-запрос, см. A01-4) — POST на /admin/films/delete/1.
+
+Что получает на выходе: каскадное удаление фильма, всех его сеансов, броней и истории бонусов (DELETE FROM bonus_history WHERE booking_id IN (...)).
+
+Насколько опасно: высоко по последствиям (потеря данных, необратимо), но это не уязвимость per se, а небезопасный дизайн (см. A06). Регистрирую как находку по A01, потому что проверка «а точно ли это тот админ» отсутствует.
+
+Находка A01-4. Все административные POST-маршруты защищены только CSRF, но ALL_ADMIN_ENDPOINTS не снимает проверку CSRF для fetch
+Файл и строка: base.js, IIFE в начале файла, window.fetch = function (input, init) { ... if (!init.headers.has('X-CSRFToken')) init.headers.set('X-CSRFToken', CSRF_TOKEN); ... }.
+
+Что даёт злоумышленник на вход: сторонний сайт шлёт fetch('/admin/films/delete/1', {method:'POST'}) — без CSRF-токена.
+
+Что получает на выходе: Flask-WTF CSRFProtect вернёт 400. Но: если жертва-админ сама зайдёт на страницу злоумышленника, тот может открыть <form action="https://mirkino/admin/films/delete/1" method="POST"> и автоподставить token не сможет — токен привязан к сессии жертвы, а злоумышленник его не знает. То есть CSRF-защита работает.
+
+Насколько опасно: не опасно. Но есть отдельный нюанс: MutationObserver в base.js вставляет csrf_token во все формы, включая формы, отправляемые на другие origin (если такие появятся). Сейчас таких нет. Проверено.
+
+A01 — что нельзя проверить чтением кода
+Реальную матрицу «какая роль что может» без описания требований: возможно, кассир должен уметь отменять любые брони — тогда A01-1 не находка.
+
+Наличие/отсутствие WAF/reverse-proxy правил, ограничивающих /admin/* по IP.
+
+A02 — Настройка по умолчанию (Security Misconfiguration)
+Вердикт: нашел
+
+Находка A02-1. Админ создаётся при первом запуске с паролем из окружения, но SEED_DEMO_DATA=1 создаёт клиентов с одинаковым паролем
+Файл и строка: db.py, seed_db, строка demo_password = os.environ.get('DEMO_PASSWORD', 'DemoPass123!') и _add_user(...) для anna@demo.ru, ivan@demo.ru, olga@demo.ru, dmitry@demo.ru, elena@demo.ru, cashier@demo.ru.
+
+Что даёт злоумышленник на вход: знает, что демо-данные включены (например, найден .env.example/README), пробует anna@demo.ru / DemoPass123!.
+
+Что получает на выходе: вход в клиентский аккаунт с ненулевым бонусным балансом (у Ольги — 18750 бонусов, у Анны — 4200, у Дмитрия — 3500).
+
+Насколько опасно: критично, если SEED_DEMO_DATA=1 остался в проде. По умолчанию переменная не задана, поэтому защита — «на честном слове администратора». Нет автоматической проверки «а не прод ли это».
+
+Находка A02-2. SECRET_KEY обязателен, но нет валидации «не дефолтный»
+Файл и строка: config.py, строка SECRET_KEY = require_env('SECRET_KEY').
+
+Что даёт злоумышленник на вход: ничего — если админ поставил SECRET_KEY=changeme (частая практика при копировании .env.example).
+
+Что получает на выходе: полный контроль над сессиями (подделка cookie session), включая админские, если не включён SESSION_COOKIE_SECURE и не проверяется IP.
+
+Насколько опасно: критично. Нет проверки длины/энтропии/«это не из примера». Проверка len(SECRET_KEY) < 32 и запрет строки changeme/secret отсутствует.
+
+Находка A02-3. Отладочный режим: FLASK_DEBUG=1 включает Werkzeug-консоль
+Файл и строка: main.py, app.run(debug=config.DEBUG, ...); config.py, DEBUG = os.environ.get('FLASK_DEBUG') == '1'.
+
+Что даёт злоумышленник на вход: если админ поставил FLASK_DEBUG=1 (в комментарии сказано «включить локально и сознательно»), злоумышленник открывает /console.
+
+Что получает на выходе: интерактивный Python-шелл в процессе сервера (если угадает PIN, который печатается в консоль). Это полный захват сервера.
+
+Насколько опасно: критично. Комментарий в main.py предупреждает, но никак не блокирует. Нет проверки «если не 127.0.0.1 — не запускаться с debug».
+
+Находка A02-4. CSP разрешает 'unsafe-inline' и 'unsafe-eval'
+Файл и строка: security.py, set_security_headers, строка:
+
+python
+"script-src 'self' 'unsafe-inline' 'unsafe-eval'; ..."
+Что даёт злоумышленник на вход: любая XSS-точка (например, инъекция в title фильма, который попадает в onclick="..." в шаблоне) — и unsafe-inline пропустит инлайн-скрипт.
+
+Что получает на выходе: исполнение JS в контексте сайта, угон сессии, CSRF-токенов.
+
+Насколько опасно: средне-высоко. CSP в текущем виде почти не защищает от XSS. Для проекта с инлайн-скриптами в шаблонах это компромисс, но unsafe-eval не нужен почти никогда.
+
+A02-5. SESSION_COOKIE_SECURE по умолчанию выключен
+Файл и строка: config.py, строка SESSION_COOKIE_SECURE = os.environ.get('FORCE_HTTPS') == '1'.
+
+Что даёт злоумышленник на вход: пассивный слушатель в той же сети (Wi-Fi кафе) ждёт HTTP-запрос.
+
+Что получает на выходе: cookie session в открытом виде → угон сессии.
+
+Насколько опасно: высоко, если прод работает по HTTP. В коде нет принудительного редиректа на HTTPS (нет ProxyFix, нет before_request, проверяющего request.is_secure).
+
+A02-6. MAX_CONTENT_LENGTH = 8 МБ, но save_uploaded_image дополнительно проверяет 5 МБ
+Файл и строка: config.py, MAX_CONTENT_LENGTH = 8 * 1024 * 1024; utils.py, save_uploaded_image, if len(raw) > 5 * 1024 * 1024.
+
+Что даёт злоумышленник на вход: файл 7 МБ.
+
+Что получает на выходе: Flask примет запрос (8 МБ), save_uploaded_image отклонит (5 МБ). Работает.
+
+Насколько опасно: не опасно. Проверено.
+
+A02 — что нельзя проверить чтением кода
+Реальные значения .env на проде.
+
+Наличие HTTPS-терминации и HSTS на уровне reverse-proxy.
+
+Наличие автоматического сканирования конфигурации в CI.
+
+A03 — Цепочка поставок и чужие зависимости (Software Supply Chain Failures)
+Вердикт: проверил
+
+A03-1. requirements.txt в проекте отсутствует
+Файл и строка: в присланных файлах нет requirements.txt, pyproject.toml, Pipfile. Импортируются: flask, flask_mail, flask_wtf, flask_limiter, qrcode, PIL, werkzeug, dotenv.
+
+Что даёт злоумышленник на вход: ничего — это отсутствие файла.
+
+Что получает на выходе: невозможно воспроизвести окружение, невозможно проверить версии на известные CVE, невозможно зафиксировать хэши.
+
+Насколько опасно: средне. Без lock-файла pip install flask через год поставит другую версию, и поведение/уязвимости изменятся. Нет pip-audit/safety в CI.
+
+A03-2. qrcode и Pillow опциональны, но проверка ImportError тихая
+Файл и строка: mailer.py, try: import qrcode ... except ImportError: QR_AVAILABLE = False; print('ВНИМАНИЕ: ...'); cabinet.py, try: import qrcode as _qrcode; QR_AVAILABLE = True except ImportError: QR_AVAILABLE = False.
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: если qrcode не установлен, билеты уходят без QR — но пользователь этого не видит. Это не безопасность, а надёжность.
+
+Насколько опасно: низко.
+
+A03-3. import secrets, import hashlib — стандартная библиотека, ок
+Файл и строка: utils.py, generate_loyalty_card_number, create_verification_code — используется secrets.randbelow. Это корректно.
+
+Насколько опасно: не опасно. Чисто для генерации кодов.
+
+A03-4. werkzeug.security.generate_password_hash без указания метода
+Файл и строка: db.py, hash_password: return generate_password_hash(password).
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: Werkzeug сам выберет метод по умолчанию — в новых версиях это scrypt, в старых — pbkdf2:sha256. Дефолт меняется между версиями, а старые хэши остаются валидными (Werkzeug хранит метод в строке хэша). Проблема: если в проекте окажется очень старая версия Werkzeug, метод может быть слабым.
+
+Насколько опасно: низко-средне. Явное method='scrypt' было бы надёжнее.
+
+A03 — что нельзя проверить чтением кода
+Версии всех зависимостей (нет lock-файла).
+
+Наличие CVE в конкретных версиях Flask/Werkzeug/Pillow.
+
+Наличие проверки целостности пакетов (hash checking) в CI.
+
+A04 — Криптография и секреты (Cryptographic Failures)
+Вердикт: нашел
+
+Находка A04-1. Legacy-пароли в виде сырого SHA-256 без соли
+Файл и строка: db.py, verify_password:
+
+python
+if stored_hash and re.fullmatch(r'[0-9a-f]{64}', stored_hash or ''):
+    import hashlib as _hashlib
+    return _hashlib.sha256(password.encode()).hexdigest() == stored_hash
+и upgrade_password_hash_if_needed.
+
+Что даёт злоумышленник на вход: получает дамп БД (например, через SQL-инъекцию или бэкап). Находит пользователей со старыми хэшами.
+
+Что получает на выходе: SHA-256 без соли → мгновенный перебор по rainbow-таблицам; одинаковые пароли дают одинаковые хэши.
+
+Насколько опасно: высоко. Легаси-совместимость — временная мера, но она остаётся в коде навсегда и не помечена сроком. Плюс: при входе хэш обновляется, но пользователи, которые не заходят, остаются уязвимыми.
+
+Находка A04-2. hash_password используется и для паролей, и для кодов подтверждения
+Файл и строка: utils.py, create_verification_code: hash_password(code); check_verification_code: check_password_hash(row['code_hash'], input_code).
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: для 6-значного кода scrypt/pbkdf2 — избыточно, но не вредно. Однако max_attempts=5 — это уже правильная защита от перебора.
+
+Насколько опасно: не опасно. Чисто (с оговоркой про производительность: scrypt на каждый ввод 6-значного кода — это CPU-нагрузка; при 5 попытках не критично).
+
+Находка A04-3. SECRET_KEY может быть коротким, хардкод отсутствует
+Файл и строка: config.py, SECRET_KEY = require_env('SECRET_KEY').
+
+Что даёт злоумышленник на вход: если админ поставил SECRET_KEY=123, злоумышленник может перебрать/угадать.
+
+Что получает на выходе: подделка Flask-сессии, включая user_id админа.
+
+Насколько опасно: высоко. В коде нет проверки длины. Рекомендуется if len(SECRET_KEY) < 32: raise RuntimeError(...).
+
+Находка A04-4. Бонусная карта: номер генерируется secrets.randbelow, но не проверяется на коллизии при вставке
+Файл и строка: utils.py, generate_loyalty_card_number: цикл while True: ... if not existing: return card_number.
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: цикл защищает от коллизий в рамках одного соединения, но при параллельной генерации двух карт возможна гонка: оба потока увидят «свободно», оба вставят → UNIQUE constraint на card_number бросит IntegrityError, и запрос упадёт.
+
+Насколько опасно: низко (вероятность коллизии 12-значного числа ~0, и падение обрабатывается Flask-ом как 500). Не критично.
+
+Находка A04-5. log_audit пишет IP, но не пишет, был ли запрос по HTTPS
+Файл и строка: db.py, log_audit: request.remote_addr or ''.
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: при работе за reverse-proxy remote_addr — это IP прокси, а не клиента. Нет ProxyFix, нет X-Forwarded-For.
+
+Насколько опасно: низко (для аудита), но снижает ценность журнала при расследовании.
+
+A04 — что нельзя проверить чтением кода
+Энтропию реального SECRET_KEY в проде.
+
+Наличие TLS на периметре.
+
+Как именно хранятся .env и бэкапы БД.
+
+A05 — Инъекции (SQL, команды, HTML)
+Вердикт: нашел
+
+Находка A05-1. f-строка в SQL с плейсхолдерами (не инъекция, но требует внимания)
+Файл и строка: api.py, api_notifications_read:
+
+python
+marks = ','.join('?' for _ in ids)
+conn.execute(f'UPDATE notifications SET read=1 WHERE user_id=? AND id IN ({marks})', [user['id']] + [int(i) for i in ids])
+и cabinet.py, api_ticket, mailer.py, send_paid_tickets_email: placeholders = ','.join('?' for _ in booking_ids) → f"""... WHERE b.id IN ({placeholders}) ...""".
+
+Что даёт злоумышленник на вход: список ids / booking_ids.
+
+Что получает на выходе: сами значения идут через ?, а f-строка вставляет только ?. Инъекции нет. Но: если в ids попадёт не-int (в api_notifications_read есть int(i) — ок; в mailer.send_paid_tickets_email есть booking_ids = [int(x) for x in booking_ids if x] — ок; в api_ticket — один ?).
+
+Насколько опасно: не опасно. Чисто по инъекциям, но паттерн «f-строка для генерации плейсхолдеров» опасен тем, что при рефакторинге кто-то вставит туда значение.
+
+Находка A05-2. SQL-инъекция через request.args в admin_bookings
+Файл и строка: admin.py, admin_bookings:
+
+python
+query += ' AND s.date=?'
+params.append(filter_date)
+...
+query += ' AND s.film_id=?'
+params.append(filter_film)
+Что даёт злоумышленник на вход: ?date=2026-01-01' OR '1'='1 или ?film_id=1 OR 1=1.
+
+Что получает на выходе: параметры идут через ?, значения не конкатенируются. Инъекции нет.
+
+Насколько опасно: не опасно. Чисто.
+
+Находка A05-3. staff.py, personal() — динамическая сборка WHERE для поиска
+Файл и строка: staff.py, personal, блок if search_q or filter_status::
+
+python
+base += ' AND (LOWER(u.name) LIKE ? OR LOWER(u.email) LIKE ? OR LOWER(COALESCE(b.custom_code,"")) LIKE ?)'
+like = f'%{search_q}%'
+params += [like, like, like]
+...
+base += ' AND b.status=?'
+params.append(filter_status)
+Что даёт злоумышленник на вход: ?q=' OR 1=1 -- или ?status=paid' OR '1'='1.
+
+Что получает на выходе: search_q уходит в LIKE ?, filter_status — в b.status=?. Инъекции нет.
+
+Насколько опасно: не опасно. Чисто.
+
+Находка A05-4. XSS через title фильма в onclick-атрибутах шаблонов
+Файл и строка: шаблоны не присланы, но в base.js есть:
+
+js
+const notif = JSON.stringify({ link: n.link || '', booking_id: n.booking_id || '' })
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+...
+'<div class="notif-item..." onclick="openNotif(' + n.id + ', ' + notif + ')">'
+и в shop.js:
+
+js
+btn.innerHTML = `<span ...>${s.time}</span><br><span ...>${s.price} ₽</span>`;
+где s.time, s.price приходят из /api/film/<id> (сервер их не экранирует, но они из БД).
+
+Что даёт злоумышленник на вход: если админ через форму добавит фильм с названием "><script>fetch('/admin/users/role/1',{method:'POST',body:...})</script>, то в шаблонах, где title вставляется в onclick="openFilmModal(<id>)" без экранирования, сработает XSS. В присланных файлах шаблонов нет, но escapeHtml в base.js есть — значит, автор знает о проблеме, но применил не везде (в renderNotifList применяется, в shop.js — нет).
+
+Что получает на выходе: исполнение JS в контексте жертвы (админа) → CSRF-токен, сессия, действия от имени админа.
+
+Насколько опасно: высоко, если шаблоны вставляют пользовательские данные без экранирования. В присланных .js файлах escapeHtml есть только в base.js. Это потенциальная находка, требующая проверки шаблонов (их нет в присланных файлах).
+
+Находка A05-5. SQL-инъекция через session_id в sell_ticket/client_book — параметры идут через ?
+Файл и строка: staff.py, sell_ticket, conn.execute('''INSERT INTO bookings ... VALUES (?,?,?,?,?,?,?,?,?)''', (...)).
+
+Что даёт злоумышленник на вход: session_id=1; DROP TABLE users;--.
+
+Что получает на выходе: session_id получен через request.form.get('session_id', type=int) — Flask вернёт None, если не int. Далее if not session_id: return jsonify({'error': ...}). Инъекции нет.
+
+Насколько опасно: не опасно. Чисто.
+
+A05-6. Командная инъекция
+Файл и строка: поиск по os.system, subprocess, eval, exec, shell=True — не найдено.
+
+Насколько опасно: не применимо.
+
+A05-7. save_uploaded_image — path traversal через secure_filename
+Файл и строка: utils.py, save_uploaded_image:
+
+python
+filename = secure_filename(f"{prefix}_{uuid.uuid4().hex}{ext}")
+Что даёт злоумышленник на вход: файл с именем ../../etc/passwd.jpg.
+
+Что получает на выходе: secure_filename вырежет ../, uuid добавит уникальность. Путь собирается через os.path.join(current_app.root_path, 'static', subfolder), subfolder — хардкод ('promotions', 'posters'). Path traversal нет.
+
+Насколько опасно: не опасно. Чисто.
+
+A05 — что нельзя проверить чтением кода
+Реальное экранирование в шаблонах (их нет в присланных файлах).
+
+Наличие SQL-инъекций в не присланных модулях (например, templates/).
+
+Поведение LIKE с % и _ в search_q — wildcard-инъекция не опасна для SQL, но может раскрыть все записи (низкий риск).
+
+A06 — Небезопасный дизайн (Insecure Design)
+Вердикт: нашел
+
+Находка A06-1. Отмена оплаченной брони клиентом без возврата (исправлено, но осталось в cancel_booking)
+Файл и строка: cabinet.py, cancel_booking:
+
+python
+if booking and booking['status'] == 'booked':
+    conn.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
+    conn.commit()
+elif booking:
+    flash('Оплаченную бронь нельзя отменить самостоятельно — обратитесь к администратору.', 'warning')
+Что даёт злоумышленник на вход: POST /cancel_booking/<id> для оплаченной брони.
+
+Что получает на выходе: сообщение-предупреждение, статус не меняется. Защита есть.
+
+Насколько опасно: не опасно. Но дизайн: возврат денег за оплаченный билет не реализован (только бонусов, и только если payment_method == 'bonus'). Если клиент оплатил банковской картой — возврат невозможен. Это бизнес-дыра, а не техническая.
+
+Находка A06-2. refund_booking возвращает бонусы, но не деньги за банковскую оплату
+Файл и строка: cabinet.py, refund_booking:
+
+python
+if booking.get('payment_method') == 'bonus' and int(booking.get('final_price') or 0) > 0:
+    ...
+Что даёт злоумышленник на вход: клиент оплатил картой, хочет вернуть.
+
+Что получает на выходе: UPDATE bookings SET status='cancelled' — и всё. Деньги не возвращаются. Клиент теряет деньги.
+
+Насколько опасно: средне (юридические/репутационные последствия). Технически — это небезопасный дизайн: возврат должен быть реализован через платёжный шлюз или запрещён.
+
+Находка A06-3. loyalty_topup отключён, но admin_loyalty_topup доступен кассиру
+Файл и строка: public.py, loyalty_topup (заглушка) и admin_loyalty_topup:
+
+python
+@roles_required('admin', 'cashier')
+def admin_loyalty_topup(user_id):
+    amount = request.form.get('amount', type=int)
+    if not amount or amount <= 0 or amount > 100000:
+        ...
+Что даёт злоумышленник на вход: кассир вводит amount=100000 для своего аккаунта (если у него есть карта) или для сообщника.
+
+Что получает на выходе: бонусы начисляются. Ограничение 100000 за раз, но нет дневного лимита, нет подтверждения второго сотрудника, нет привязки к кассовой смене/чеку.
+
+Насколько опасно: средне-высоко. Это внутренняя угроза: кассир может «рисовать» бонусы.
+
+Находка A06-4. client_book и sell_ticket не проверяют, что сеанс ещё не начался, по времени с часовым поясом
+Файл и строка: staff.py, client_book и sell_ticket:
+
+python
+now_date = date.today().isoformat()
+now_time = datetime.now().strftime('%H:%M')
+if sess['date'] < now_date or (sess['date'] == now_date and sess['time'] < now_time):
+    return jsonify({'error': 'Сеанс уже прошёл'}), 400
+Что даёт злоумышленник на вход: ничего — это не атака, а дизайн. Но: datetime.now() — локальное время сервера. Если сервер в UTC, а кинотеатр в Москве (UTC+3), то в 22:00 по Москве сервер считает, что ещё 19:00, и продаёт билеты на уже прошедший сеанс. Или наоборот: сервер в Москве, кинотеатр в Калининграде (UTC+2) — продажа закрывается на час раньше.
+
+Насколько опасно: средне. Нет tzinfo, нет хранения таймзоны кинотеатра.
+
+Находка A06-5. admin_hall_edit: при изменении capacity удаляются все брони на места этого зала
+Файл и строка: admin.py, admin_hall_edit:
+
+python
+if old['capacity'] != capacity:
+    ...
+    conn.execute('DELETE FROM bookings WHERE seat_id IN (SELECT id FROM seats WHERE hall_id=?)', (hall_id,))
+    conn.execute('DELETE FROM seats WHERE hall_id=?', (hall_id,))
+Что даёт злоумышленник на вход: админ меняет вместимость зала с 96 на 95.
+
+Что получает на выходе: все брони на этот зал (включая оплаченные!) удаляются без уведомления клиентов и без возврата.
+
+Насколько опасно: высоко. Это необратимая потеря данных и денег клиентов. Нет подтверждения, нет уведомления, нет возврата.
+
+A06 — что нельзя проверить чтением кода
+Требования бизнеса: возможно, возврат денег не предусмотрен.
+
+Часовой пояс сервера и кинотеатра.
+
+Наличие кассовой дисциплины и инструкций для кассиров.
+
+A07 — Аутентификация и сессии (Authentication Failures)
+Вердикт: нашел
+
+Находка A07-1. login не имеет защиты от брутфорса по конкретному email
+Файл и строка: users_auth.py, login:
+
+python
+@users_bp.route('/login', methods=['POST'])
+@limiter.limit('10 per minute')
+def login():
+Что даёт злоумышленник на вход: 10 попыток в минуту с одного IP. При распределённом брутфорсе (100 IP) — 1000 попыток/минуту. Нет счётчика неудачных попыток на email, нет временной блокировки аккаунта.
+
+Что получает на выходе: подбор слабого пароля. flash('Неверный email или пароль', 'danger') — одинаковый текст, это хорошо (не раскрывает существование email).
+
+Насколько опасно: средне-высоко. Нет fail2ban-логики на уровне приложения, нет CAPTCHA.
+
+Находка A07-2. send_recovery_code не раскрывает существование email, но send_registration_code раскрывает
+Файл и строка: users_auth.py, send_registration_code:
+
+python
+existing = conn.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
+if existing:
+    conn.close()
+    return {"status": "error", "message": "Email уже зарегистрирован"}, 400
+Что даёт злоумышленник на вход: email victim@example.com.
+
+Что получает на выходе: «Email уже зарегистрирован» → подтверждение, что аккаунт существует. Это позволяет составлять список валидных email для фишинга/брутфорса.
+
+Насколько опасно: низко-средне. Аналогично в send_email_change_code: «Email уже занят другим пользователем».
+
+Находка A07-3. Сессия не инвалидируется при смене пароля другими сессиями
+Файл и строка: cabinet.py, update_password:
+
+python
+session.clear()
+return {"status": "ok", "message": "Пароль изменён. Войдите заново.", "logout": True}
+и users_auth.py, reset_password: только UPDATE users SET password=?, сессии не трогаются.
+
+Что даёт злоумышленник на вход: если у жертвы угнали сессию, она останется активной после смены пароля. Flask-сессии подписаны, но не имеют серверного хранилища — session.clear() чистит только текущую.
+
+Что получает на выходе: злоумышленник продолжает работать под угнанной сессией, пока она не истечёт (12 часов, PERMANENT_SESSION_LIFETIME).
+
+Насколько опасно: высоко. Нет «session version» / «password_changed_at», который бы инвалидировал все сессии.
+
+Находка A07-4. session.permanent = True с PERMANENT_SESSION_LIFETIME = 12 часов
+Файл и строка: config.py, PERMANENT_SESSION_LIFETIME = timedelta(hours=12); users_auth.py, login: session.permanent = True.
+
+Что даёт злоумышленник на вход: ничего.
+
+Что получает на выходе: сессия живёт 12 часов без активности. Нет SESSION_REFRESH_EACH_REQUEST, нет idle-timeout.
+
+Насколько опасно: низко-средне. Для админки 12 часов — много.
+
+Находка A07-5. verify_registration_code делает session.clear() и сразу логинит
+Файл и строка: users_auth.py, verify_registration_code:
+
+python
+session.clear()
+session.permanent = True
+session['user_id'] = user['id']
+session['user_role'] = user['role']
+Что даёт злоумышленник на вход: подтверждает код регистрации.
+
+Что получает на выходе: новая сессия. Это правильно (анти-fixation).
+
+Насколько опасно: не опасно. Чисто.
+
+Находка A07-6. login не проверяет is_banned до verify_password — но проверяет после
+Файл и строка: users_auth.py, login:
+
+python
+if user and verify_password(user['password'], password):
+    if user['is_banned']:
+        conn.close()
+        flash('Ваш аккаунт заблокирован.', 'danger')
+        return redirect(url_for('index'))
+Что даёт злоумышленник на вход: логинится с правильным паролем, но забанен.
+
+Что получает на выходе: сообщение «заблокирован». Это раскрывает факт блокировки. Плюс: verify_password выполняется до проверки бана — это лишняя нагрузка на CPU при брутфорсе забаненных аккаунтов (не критично).
+
+Насколько опасно: низко.
+
+Находка A07-7. enforce_ban_and_session_hygiene очищает сессию, но не редиректит
+Файл и строка: security.py, enforce_ban_and_session_hygiene:
+
+python
+if 'user_id' in session:
+    ...
+    if not row or row['is_banned']:
+        session.clear()
+Что даёт злоумышленник на вход: забаненный пользователь с активной сессией делает запрос.
+
+Что получает на выходе: session.clear(), но запрос продолжает выполняться (нет return redirect). Для страниц, которые проверяют login_required, это сработает (сессия пуста → редирект). Но для маршрутов, которые не проверяют сессию (например, index), пользователь просто увидит главную. Для API, которые не проверяют сессию (например, api_session_seats), запрос выполнится. Это не критично, но неаккуратно.
+
+Насколько опасно: низко.
+
+A07 — что нельзя проверить чтением кода
+Реальную стойкость паролей пользователей.
+
+Наличие CAPTCHA/2FA в проде.
+
+Наличие fail2ban на периметре.
+
+A08 — Целостность данных и сборки (Software and Data Integrity Failures)
+Вердикт: нашел
+
+Находка A08-1. Нет проверки целостности загружаемых изображений на уровне содержимого (только PIL.verify)
+Файл и строка: utils.py, save_uploaded_image:
+
+python
+try:
+    img = Image.open(io.BytesIO(raw))
+    img.verify()
+except Exception:
+    return None, 'Файл повреждён или не является изображением'
+Что даёт злоумышленник на вход: PNG с полиглотом (валидный PNG + PHP-код в конце) или JPEG с EXIF-метаданными, содержащими XSS (если где-то отображается EXIF).
+
+Что получает на выходе: PIL.verify проверяет только структуру изображения, не содержимое. Полиглот пройдёт. Если сервер отдаёт файл с Content-Type: image/png и X-Content-Type-Options: nosniff (есть в security.py), браузер не исполнит PHP. Но: если файл попадёт в директорию, где выполняется PHP/Python (например, static/ — обычно нет), это может сработать.
+
+Насколько опасно: низко-средне. nosniff и static/ снижают риск. Но нет пересохранения изображения через img.save() (что убило бы полиглоты).
+
+Находка A08-2. SECRET_KEY не ротируется, нет key_version
+Файл и строка: config.py, SECRET_KEY = require_env('SECRET_KEY').
+
+Что даёт злоумышленник на вход: если SECRET_KEY утёк, все сессии скомпрометированы навсегда.
+
+Что получает на выходе: подделка сессий.
+
+Насколько опасно: высоко. Нет механизма ротации (Flask поддерживает список ключей через SECRET_KEY_FALLBACKS, но он не используется).
+
+Находка A08-3. verification_codes хранит payload в открытом виде (JSON с хэшем пароля)
+Файл и строка: users_auth.py, send_registration_code:
+
+python
+payload = json.dumps({'name': name, 'password_hash': hash_password(password)})
+code = create_verification_code(conn, 'registration', email, payload)
+и db.py, таблица verification_codes: payload TEXT.
+
+Что даёт злоумышленник на вход: получает дамп БД.
+
+Что получает на выходе: видит payload с password_hash (scrypt) и именем. Хэш уже стойкий, но payload не шифруется. Плюс: если админ создаст код для регистрации, а пользователь не завершит — payload останется в БД до DELETE при следующем create_verification_code для того же email.
+
+Насколько опасно: низко-средне. Хэш пароля — не plaintext, но лишние данные в БД.
+
+A08 — что нельзя проверить чтением кода
+Наличие проверки подписей пакетов в CI/CD.
+
+Наличие code review и защиты ветки main.
+
+Наличие SRI для внешних скриптов (в проекте внешних нет).
+
+A09 — Логирование и слежение (Logging and Alerting Failures)
+Вердикт: нашел
+
+Находка A09-1. log_audit глотает исключения
+Файл и строка: db.py, log_audit:
+
+python
+try:
+    conn.execute('INSERT INTO audit_log ...')
+except Exception:
+    pass
+Что даёт злоумышленник на вход: создаёт условия, при которых audit_log недоступен (например, блокировка БД, переполнение диска).
+
+Что получает на выходе: все действия перестают логироваться, и никто об этом не узнает. Нет fallback в файл, нет алерта.
+
+Насколько опасно: высоко. Аудит — ключевой элемент безопасности. Его отказ должен быть заметен.
+
+Находка A09-2. Нет логирования неудачных попыток входа
+Файл и строка: users_auth.py, login: в ветке else (неверный пароль) — только flash, нет log_audit.
+
+Что даёт злоумышленник на вход: перебирает пароли.
+
+Что получает на выходе: ни одна неудачная попытка не попадает в audit_log. Нет возможности обнаружить брутфорс по журналу.
+
+Насколько опасно: средне-высоко. Для расследования инцидентов это критично.
+
+Находка A09-3. Нет логирования CSRF-ошибок и 403/404
+Файл и строка: security.py, register_security_handlers — только before_request (бан) и after_request (заголовки). Нет @app.errorhandler(400/403/404/500).
+
+Что даёт злоумышленник на вход: сканирует сайт, получает 404/403.
+
+Что получает на выходе: ничего не логируется. Нет возможности обнаружить сканирование.
+
+Насколько опасно: средне.
+
+Находка A09-4. print вместо логгера
+Файл и строка: cabinet.py, print(f"Ошибка SMTP ..."); mailer.py, print('Ошибка отправки письма с билетами:', e); utils.py, print(f'Ошибка создания уведомления: {e}'); db.py — нет, там pass.
+
+Что даёт злоумышленник на вход: вызывает ошибку SMTP.
+
+Что получает на выходе: сообщение в stdout, которое может содержать email/данные. Нет структурированного лога, нет уровней, нет отправки в SIEM.
+
+Насколько опасно: низко-средне.
+
+Находка A09-5. audit_log не защищён от изменения админом
+Файл и строка: admin.py, admin_audit: SELECT ... FROM audit_log ... ORDER BY a.id DESC LIMIT 300. Нет удаления/редактирования, но и нет защиты от прямого SQL-доступа.
+
+Что даёт злоумышленник на вход: получает админский доступ к БД.
+
+Что получает на выходе: может удалить/изменить записи audit_log (нет append-only, нет хэш-цепочки).
+
+Насколько опасно: средне. Для полноценного аудита нужна tamper-evident запись.
+
+A09 — что нельзя проверить чтением кода
+Наличие централизованного сбора логов (ELK/Splunk).
+
+Наличие алертов на аномалии.
+
+Реальное содержимое audit_log в проде.
+
+A10 — Обработка нештатных ситуаций (Mishandling of Exceptional Conditions)
+Вердикт: нашел
+
+Находка A10-1. except Exception: pass в log_audit — уже отмечено в A09-1
+Находка A10-2. except Exception as e: flash(f'Не удалось удалить фильм: {e}', 'danger') — раскрытие внутренней ошибки
+Файл и строка: admin.py, admin_film_delete:
+
+python
+except sqlite3.Error as e:
+    conn.rollback()
+    flash(f'Не удалось удалить фильм: {e}', 'danger')
+аналогично admin_hall_delete, admin_session_delete.
+
+Что даёт злоумышленник на вход: провоцирует ошибку БД (например, через конкурентный запрос).
+
+Что получает на выходе: текст ошибки SQLite (например, FOREIGN KEY constraint failed или database is locked), который раскрывает структуру БД.
+
+Насколько опасно: низко-средне. Для админа — не критично, но в проде лучше логировать, а пользователю показывать общее сообщение.
+
+Находка A10-3. except Exception: без логирования в save_uploaded_image
+Файл и строка: utils.py, save_uploaded_image:
+
+python
+try:
+    img = Image.open(io.BytesIO(raw))
+    img.verify()
+except Exception:
+    return None, 'Файл повреждён или не является изображением'
+Что даёт злоумышленник на вход: отправляет повреждённый файл.
+
+Что получает на выходе: сообщение об ошибке. Исключение не логируется — если PIL падает по неожиданной причине (например, CVE в библиотеке), это не будет замечено.
+
+Насколько опасно: низко.
+
+Находка A10-4. send_paid_tickets_email глотает исключение
+Файл и строка: mailer.py, send_paid_tickets_email:
+
+python
+try:
+    mail.send(msg)
+except Exception as e:
+    print('Ошибка отправки письма с билетами:', e)
+Что даёт злоумышленник на вход: ничего — SMTP недоступен.
+
+Что получает на выходе: клиент оплатил билет, но письмо не ушло. Клиент не узнает, что билет не отправлен. В client_pay_booking возвращается {'ok': True, 'message': 'Билеты оплачены и отправлены на вашу почту'} — ложь.
+
+Насколько опасно: средне. Клиент может прийти в кинотеатр без билета. Нет повторной отправки, нет уведомления админа.
+
+Находка A10-5. api_favorite — conn.close() до log_audit
+Файл и строка: api.py, api_favorite:
+
+python
+if exists:
+    conn.execute('DELETE FROM favorites WHERE id=?', (exists['id'],))
+    conn.commit()
+    conn.close()
+    log_audit(conn, user, 'favorite_remove', ...)
+    return jsonify({'ok': True, 'favorite': False})
+Что даёт злоумышленник на вход: удаляет фильм из избранного.
+
+Что получает на выходе: log_audit вызывается на закрытом соединении → sqlite3.ProgrammingError: Cannot operate on a closed database. Это исключение не обёрнуто в try/except, поэтому log_audit падает, но try/except внутри log_audit ловит Exception и pass → действие не логируется, и клиент получает {'ok': True}.
+
+Насколько опасно: средне. Это баг, который отключает аудит для удаления из избранного. Аналогично в api_favorite для добавления: conn.close() до log_audit — та же проблема.
+
+Строка: api.py, api_favorite, вторая ветка: conn.close() перед log_audit(conn, user, 'favorite_add', ...).
+
+Находка A10-6. confirm_payment использует conn после conn.close()
+Файл и строка: staff.py, confirm_payment:
+
+python
+conn.commit()
+conn.close()
+
+if recipient:
+    ...
+    add_notification(conn, recipient['user_id'], ...)
+    send_paid_tickets_email(...)
+Что даёт злоумышленник на вход: кассир подтверждает оплату.
+
+Что получает на выходе: add_notification вызывает conn.execute на закрытом соединении → исключение, которое add_notification ловит (except Exception as e: print(...)) → уведомление не создаётся. Клиент не получает уведомление об оплате.
+
+Насколько опасно: средне. Функциональный баг с последствиями для UX и аудита.
+
+Находка A10-7. client_pay_booking — send_paid_tickets_email после conn.close()
+Файл и строка: cabinet.py, client_pay_booking:
+
+python
+conn.commit()
+...
+conn.close()
+send_paid_tickets_email(user['email'], [booking_id])
+send_paid_tickets_email внутри открывает новое соединение (get_db()), поэтому это не баг. Проверено.
+
+Насколько опасно: не опасно. Чисто.
+
+Находка A10-8. sell_ticket — add_notification после conn.commit(), но до conn.close()
+Файл и строка: staff.py, sell_ticket:
+
+python
+conn.commit()
+log_audit(conn, current_user(), 'sell_ticket', ...)
+add_notification(conn, client['id'], ...)
+conn.close()
+Что даёт злоумышленник на вход: кассир продаёт билет.
+
+Что получает на выходе: add_notification делает conn.commit() внутри. Работает.
+
+Насколько опасно: не опасно. Чисто.
+
+A10 — что нельзя проверить чтением кода
+Поведение при переполнении диска, OOM, таймаутах БД.
+
+Наличие retry-логики для SMTP.
+
+Наличие мониторинга ошибок (Sentry).
+
+Legacy-файлы и функции
+Вердикт: нашел
+
+L-1. verify_password поддерживает SHA-256 без соли
+Файл и строка: db.py, verify_password, re.fullmatch(r'[0-9a-f]{64}', stored_hash or '').
+
+Опасность: высокая. Это legacy-совместимость, которая не имеет срока удаления. Пользователи, которые не заходят, остаются с слабыми хэшами.
+
+L-2. register (GET/POST) — заглушка, но остаётся в ALL_AUTH_ENDPOINTS
+Файл и строка: users_auth.py, register:
+
+python
+if request.method == 'POST':
+    ...
+    flash('Подтвердите регистрацию кодом из письма.', 'warning')
+    return redirect(url_for('index'))
+return redirect(url_for('index'))
+Опасность: низкая. Это мёртвый код, но он зарегистрирован как endpoint (ALL_AUTH_ENDPOINTS), и на него можно POST-ить. Он не создаёт пользователя, но создаёт путаницу.
+
+L-3. loyalty_create и loyalty_topup — заглушки
+Файл и строка: public.py, loyalty_create и loyalty_topup.
+
+Опасность: низкая. Мёртвый код.
+
+L-4. spend_bonuses_for_booking / award_bonus_for_booking — вызываются в confirm_payment без проверки payment_method
+Файл и строка: staff.py, confirm_payment:
+
+python
+conn.execute("UPDATE bookings SET status = 'paid', payment_method = COALESCE(payment_method, 'bank') WHERE id = ?", (booking_id,))
+...
+award_bonus_for_booking(conn, booking_id)
+award_bonus_for_booking внутри:
+
+python
+if booking['payment_method'] != 'bonus':
+    return
+Опасность: не опасно. Чисто.
+
+L-5. hashlib импортируется внутри функции
+Файл и строка: db.py, verify_password: import hashlib as _hashlib.
+
+Опасность: не опасно. Стилистическая мелочь.
+
+L-6. import secrets внутри seed_db и utils.generate_loyalty_card_number
+Файл и строка: db.py, seed_db: import secrets; utils.py, generate_loyalty_card_number: import secrets.
+
+Опасность: не опасно.
+
+L-7. __import__('datetime').timedelta в admin.py
+Файл и строка: admin.py, admin:
+
+python
+day = (date.today() + __import__('datetime').timedelta(days=d)).isoformat()
+Опасность: не опасно, но это legacy-стиль. timedelta уже импортирован в начале файла? Нет — в admin.py импортирован from datetime import date, datetime, но не timedelta. Поэтому используется __import__. Работает, но некрасиво.
+
+Разбиение модулей на подфайлы
+Вердикт: проверил
+
+R-1. Python-модули разбиты хорошо
+app.py — фабрика + расширения.
+
+config.py — конфигурация.
+
+db.py — БД + seed.
+
+security.py — декораторы + обработчики.
+
+utils.py — утилиты.
+
+mailer.py — почта.
+
+users_auth.py, public.py, cabinet.py, api.py, staff.py, admin.py — blueprint'ы.
+
+main.py — сборка.
+
+Это чисто. Единственное замечание: utils.py смешивает утилиты, работу с лояльностью, уведомления, верификационные коды и загрузку файлов. Это God Object — при росте проекта его стоит разбить на utils/ (пакет).
+
+R-2. HTML/CSS/JS разбиты, но есть дублирование
+base.js — CSRF, модалка авторизации, уведомления, модалка билета.
+
+shop.js — покупка билетов.
+
+home.js — ротатор.
+
+films.js — фильтры.
+
+film.js — отзывы.
+
+promotions.js — акции.
+
+Проблема: base.js содержит и CSRF, и авторизацию, и уведомления, и билеты. Это God File. При росте проекта его стоит разбить.
+
+Проблема 2: в base.js есть глобальные функции (showTab, togglePass, openAuthModal), которые могут конфликтовать с другими скриптами. Нет модульной изоляции (IIFE/ES-модулей).
+
+Проблема 3: window.onclick = function(event) { ... } в base.js перезаписывает window.onclick, если другой скрипт тоже его ставит. Это legacy-паттерн.
+
+R-3. Нет разделения CSS
+CSS не прислан, но в base.js есть инлайн-стили. Это смешение.
+
+Сводная таблица
+Категория	Вердикт	Ключевые находки
+A01 Контроль доступа	нашел	A01-1 (кассир отменяет любые брони), A01-2 (админ банит админа), A01-3 (каскадные удаления)
+A02 Настройка по умолчанию	нашел	A02-1 (демо-пароли), A02-2 (слабый SECRET_KEY), A02-3 (debug-консоль), A02-4 (unsafe-inline/eval), A02-5 (Secure cookie)
+A03 Цепочка поставок	проверил	Нет requirements.txt/lock, нет pip-audit
+A04 Криптография	нашел	A04-1 (SHA-256 без соли), A04-3 (короткий SECRET_KEY)
+A05 Инъекции	нашел	A05-4 (потенциальный XSS в шаблонах/JS), остальное чисто
+A06 Небезопасный дизайн	нашел	A06-2 (нет возврата денег), A06-3 (кассир рисует бонусы), A06-4 (таймзона), A06-5 (удаление броней при смене capacity)
+A07 Аутентификация	нашел	A07-1 (нет антибрутфорса), A07-3 (нет инвалидации сессий)
+A08 Целостность	нашел	A08-1 (полиглоты), A08-3 (payload в БД)
+A09 Логирование	нашел	A09-1 (глотает исключения), A09-2 (нет лога неудачных входов)
+A10 Нештатные ситуации	нашел	A10-5 (log_audit на закрытом conn), A10-6 (add_notification на закрытом conn), A10-4 (ложь об отправке письма)
+Legacy	нашел	L-1 (SHA-256), L-2 (мёртвый register)
+Разбиение модулей	проверил	God Object в utils.py и base.js
+Что нельзя проверить чтением кода
+Реальные значения .env — SECRET_KEY, ADMIN_PASSWORD, DEMO_PASSWORD, MAIL_PASSWORD.
+
+Наличие HTTPS и HSTS на периметре.
+
+Версии зависимостей — нет lock-файла.
+
+Шаблоны HTML — не присланы, поэтому XSS в них нельзя подтвердить (только предположить).
+
+CSS — не прислан.
+
+Наличие WAF/IDS/fail2ban на периметре.
+
+Наличие мониторинга (Sentry, ELK) и алертов.
+
+Реальные данные в БД — есть ли пользователи со старыми SHA-256 хэшами.
+
+Часовой пояс сервера и кинотеатра.
+
+Наличие бэкапов и их защита.
+
+Права доступа к файлам на сервере (mirkino.db, static/, .env).
+
+Наличие code review и защиты ветки main в git.
+
+Поведение PIL.Image.verify() на конкретных полиглотах — зависит от версии Pillow.
+
+Реальная нагрузка и поведение при конкурентных запросах к SQLite.
+
+Наличие SRI для внешних скриптов — в проекте внешних нет, но если появятся, это не проверяется.
